@@ -114,6 +114,20 @@ void RePlanner::LocalMapCb(const kr_planning_msgs::VoxelMap::ConstPtr& msg) {
   local_map_ptr_ = msg;
 }
 
+void RePlanner::IncrementWaypointIdx() {
+  cur_cb_waypoint_idx_ = cur_cb_waypoint_idx_ + 1;
+  std_msgs::Int8 msg;
+  msg.data = cur_cb_waypoint_idx_;
+  waypoint_idx_pub_.publish(msg);
+}
+
+void RePlanner::ResetWaypointIdx() {
+  cur_cb_waypoint_idx_ = 0;
+  std_msgs::Int8 msg;
+  msg.data = cur_cb_waypoint_idx_;
+  waypoint_idx_pub_.publish(msg);
+}
+
 void RePlanner::ReplanGoalCb() {
   boost::mutex::scoped_lock lock(mtx_);
   // accept new goal (ref:
@@ -138,6 +152,8 @@ void RePlanner::ReplanGoalCb() {
       AbortFullMission();
       // AbortReplan();
     } else {
+      // use existing goals
+      pose_goals_ = goal->p_finals;
       // update the waypoint idx to continue executing the remaining waypoints
       // from the previous replan callback
       ROS_INFO("Last replan process has finished %d waypoints!",
@@ -145,9 +161,9 @@ void RePlanner::ReplanGoalCb() {
     }
   } else {
     // reset cur_cb_waypoint_idx
-    cur_cb_waypoint_idx_ = 0;
+    ResetWaypointIdx();
     // this means starting a new mission
-    ROS_INFO("Non-empty goal is sent, excecuting a new mission...");
+    ROS_INFO("Excecuting a new mission...");
     if ((goal->p_finals).empty()) {
       ROS_INFO("waypoints list is empty, now using single goal intead!");
       pose_goals_.push_back(goal->p_final);
@@ -254,7 +270,7 @@ void RePlanner::setup_replanner() {
           "Initial waypoint is already close to the robot "
           "position, continuing "
           "with the next waypoint!");
-      cur_cb_waypoint_idx_ = cur_cb_waypoint_idx_ + 1;
+      IncrementWaypointIdx();
       pose_goal_ = pose_goals_[cur_cb_waypoint_idx_];
       TransformGlobalGoal();
     }
@@ -270,7 +286,7 @@ void RePlanner::setup_replanner() {
       global_tpgoal);  // only send goal, because global plan server is
                        // subscribing to odom and use that as start
   // global initial plan timeout duration
-  double initial_global_timeout_dur = 6.0 * local_timeout_duration_;
+  double initial_global_timeout_dur = 5.0 * local_timeout_duration_;
   bool global_finished_before_timeout = global_plan_client_->waitForResult(
       ros::Duration(initial_global_timeout_dur));
   // check result of global plan
@@ -278,6 +294,19 @@ void RePlanner::setup_replanner() {
     ROS_ERROR_STREAM(
         "initial global planning timed out, its timeout duration is set as: "
         << initial_global_timeout_dur);
+
+    // Skip waypoint if timed out
+    if (cur_cb_waypoint_idx_ >= (pose_goals_.size() - 1)) {
+      ROS_ERROR(
+          "The next waypoint is the final waypoint in the mission, aborting "
+          "this full mission!");
+      ResetWaypointIdx();
+      pose_goals_.clear();
+    } else {
+      IncrementWaypointIdx();
+      ROS_ERROR_STREAM("skipping the waypoint: " << cur_cb_waypoint_idx_);
+    }
+
     AbortReplan();
     return;
   }
@@ -287,6 +316,18 @@ void RePlanner::setup_replanner() {
         global_result->path);  // extract the global path information
     ROS_WARN("initial global plan succeeded!");
   } else {
+    // Skip waypoint if failed
+    if (cur_cb_waypoint_idx_ >= (pose_goals_.size() - 1)) {
+      ROS_ERROR(
+          "The next waypoint is the final waypoint in the mission, aborting "
+          "this full mission!");
+      ResetWaypointIdx();
+      pose_goals_.clear();
+    } else {
+      IncrementWaypointIdx();
+      ROS_ERROR_STREAM("skipping the waypoint: " << cur_cb_waypoint_idx_);
+    }
+
     ROS_WARN("initial global plan failed!");
     AbortReplan();
     return;
@@ -343,7 +384,7 @@ void RePlanner::setup_replanner() {
 
   // wait for result (initial timeout duration can be large because robot is not
   // moving)
-  double initial_local_timeout_dur = local_timeout_duration_ * 2.0;
+  double initial_local_timeout_dur = local_timeout_duration_ * 3.0;
   bool local_finished_before_timeout = local_plan_client_->waitForResult(
       ros::Duration(initial_local_timeout_dur));
 
@@ -356,11 +397,36 @@ void RePlanner::setup_replanner() {
     ROS_ERROR_STREAM(
         "Initial local planning timed out, its timeout duration is set as: "
         << initial_local_timeout_dur);
+
+    // Skip waypoint if timed out
+    if (cur_cb_waypoint_idx_ >= (pose_goals_.size() - 1)) {
+      ROS_ERROR(
+          "The next waypoint is the final waypoint in the mission, aborting "
+          "this full mission!");
+      ResetWaypointIdx();
+      pose_goals_.clear();
+    } else {
+      IncrementWaypointIdx();
+      ROS_ERROR_STREAM("skipping the waypoint: " << cur_cb_waypoint_idx_);
+    }
+
     AbortReplan();
     return;
   }
   auto local_result = local_plan_client_->getResult();
   if (!local_result->success) {
+    // Skip waypoint if failed
+    if (cur_cb_waypoint_idx_ >= (pose_goals_.size() - 1)) {
+      ROS_ERROR(
+          "The next waypoint is the final waypoint in the mission, aborting "
+          "this full mission!");
+      ResetWaypointIdx();
+      pose_goals_.clear();
+    } else {
+      IncrementWaypointIdx();
+      ROS_ERROR_STREAM("skipping the waypoint: " << cur_cb_waypoint_idx_);
+    }
+
     ROS_ERROR("Initial local planning failed to find a local trajectory!");
     AbortReplan();
     return;
@@ -611,7 +677,7 @@ void RePlanner::update_status() {
                 << " waypoints received");
       } else if (cur_cb_waypoint_idx_ < (pose_goals_.size() - 1)) {
         // take the next waypoint if the intermidiate waypoint is reached
-        cur_cb_waypoint_idx_ = cur_cb_waypoint_idx_ + 1;
+        IncrementWaypointIdx();
         ROS_INFO_STREAM(
             "Intermidiate waypoint reached according to x and y positions, "
             "continue to the next waypoint, "
@@ -953,7 +1019,7 @@ void RePlanner::StateTriggerCb(const std_msgs::String::ConstPtr& msg) {
     ROS_WARN("Reset mission button is clicked! Now resetting the mission!");
     abort_full_mission = true;
     // reset waypoint index so that the user can send a new mission
-    cur_cb_waypoint_idx_ = 0;
+    ResetWaypointIdx();
     pose_goals_.clear();
   } else if (requested_state == "skip_next_waypoint") {
     ROS_INFO("Skip next waypoint button is clicked!");
@@ -972,7 +1038,7 @@ void RePlanner::StateTriggerCb(const std_msgs::String::ConstPtr& msg) {
       ROS_ERROR("++++++++++++++++++++++++++++++++++++++++++++++++++++++++");
       abort_full_mission = true;
       // reset waypoint index so that the user can send a new mission
-      cur_cb_waypoint_idx_ = 0;
+      ResetWaypointIdx();
       pose_goals_.clear();
     } else {
       // Else, skip the next waypoint by adding 1 to cur_cb_waypoint_idx_
@@ -981,17 +1047,24 @@ void RePlanner::StateTriggerCb(const std_msgs::String::ConstPtr& msg) {
       // num_trials > max_replan_trials you set. You can just click
       // execute waypoint mission again to force re-start it...
 
-      cur_cb_waypoint_idx_++;
+      IncrementWaypointIdx();
       // to immediate make this in effect, we will abort current replan and have
       // the state machine re-enter the replan (after calling stopping policy)
       AbortReplan();
     }
+  } else if (requested_state == "switch_to_exploration") {
+    // state machine will manipulate the waypoints and start exploration
+    AbortReplan();
+    ROS_WARN("++++++++++++++++++++++++++++++++++++++++++++++++++++++++");
+    ROS_WARN("Switching to exploration mode!");
+    ROS_WARN("++++++++++++++++++++++++++++++++++++++++++++++++++++++++");
   } else {
     ROS_ERROR_STREAM(
         "Wrong replanner state trigger information received, which is: "
         << requested_state
         << " , only allowed replanner state trigger msgs are "
-           "skip_next_waypoint and reset_mission. Check!!!");
+           "skip_next_waypoint, switch_to_exploration and reset_mission. "
+           "Check!!!");
   }
 
   if (abort_full_mission) {
@@ -1032,6 +1105,8 @@ RePlanner::RePlanner() : nh_("~") {
       "/timing/replanner/global_replan", 1);
   time_pub2 = priv_nh.advertise<sensor_msgs::Temperature>(
       "/timing/replanner/local_replan", 1);
+
+  waypoint_idx_pub_ = priv_nh.advertise<std_msgs::Int8>("/waypoint_idx", 1);
 
   cropped_path_pub_ =
       priv_nh.advertise<kr_planning_msgs::Path>("cropped_local_path", 1, true);
